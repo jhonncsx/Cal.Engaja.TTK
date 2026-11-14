@@ -6,13 +6,15 @@ Como rodar localmente:
     streamlit run app.py
 
 Como funciona (resumo):
-    1. O app gera uma base SIMULADA de vídeos (categoria, hashtags, alcance).
-    2. Treina uma rede neural de regressão (TensorFlow/Keras) para prever
-       o alcance a partir da categoria e do número de hashtags.
+    1. Ao abrir, o app treina um modelo com uma base SIMULADA de vídeos.
+    2. Na barra lateral, a equipe pode enviar arquivos CSV com dados reais
+       (colunas: categoria, hashtags, alcance) e clicar em "Treinar modelo"
+       para retreinar a rede neural (TensorFlow/Keras) com esses dados.
     3. O usuário escolhe categoria e hashtags em caixas de seleção e o app
        mostra o alcance previsto com um alerta: Flopado, Regular ou Viral.
 """
 
+import io
 import os
 
 # Reduz mensagens de log do TensorFlow (precisa vir ANTES do import do tensorflow)
@@ -30,7 +32,10 @@ from tensorflow import keras
 SEED = 42                # Semente fixa: resultados reprodutíveis
 N_VIDEOS = 2000          # Tamanho da base simulada
 EPOCAS = 60              # Quantas vezes o modelo "revê" os dados no treino
-MAX_HASHTAGS = 15        # Máximo de hashtags oferecido na tela
+MAX_HASHTAGS = 15        # Máximo de hashtags da base simulada
+LIMITE_HASHTAGS = 30     # Linhas com mais hashtags que isso são ignoradas no upload
+MIN_LINHAS = 30          # Mínimo de linhas válidas para treinar com arquivos
+COLUNAS = ["categoria", "hashtags", "alcance"]
 
 LIMITE_FLOP = 10_000     # Abaixo disso: Flopado
 LIMITE_VIRAL = 100_000   # Acima disso: Viral
@@ -45,11 +50,11 @@ ALCANCE_BASE = {
     "Culinária": 40_000,
     "Fitness": 25_000,
 }
-CATEGORIAS = list(ALCANCE_BASE.keys())
+CATEGORIAS_SIMULADAS = list(ALCANCE_BASE.keys())
 
 
 # ---------------------------------------------------------------------------
-# 2) BASE SIMULADA
+# 2) DADOS: BASE SIMULADA E LEITURA DOS ARQUIVOS ENVIADOS
 # ---------------------------------------------------------------------------
 def gerar_base_simulada() -> pd.DataFrame:
     """
@@ -60,7 +65,7 @@ def gerar_base_simulada() -> pd.DataFrame:
       - um ruído aleatório deixa os dados mais realistas.
     """
     rng = np.random.default_rng(SEED)
-    categorias = rng.choice(CATEGORIAS, size=N_VIDEOS)
+    categorias = rng.choice(CATEGORIAS_SIMULADAS, size=N_VIDEOS)
     hashtags = rng.integers(0, MAX_HASHTAGS + 1, size=N_VIDEOS)
 
     base = np.array([ALCANCE_BASE[c] for c in categorias], dtype="float64")
@@ -80,25 +85,87 @@ def gerar_base_simulada() -> pd.DataFrame:
     )
 
 
-# ---------------------------------------------------------------------------
-# 3) TREINO DO MODELO
-# ---------------------------------------------------------------------------
-@st.cache_resource(show_spinner="Preparando o modelo, aguarde alguns segundos...")
-def treinar_modelo():
+def ler_arquivos(arquivos) -> tuple:
     """
-    Treina a rede e devolve (modelo, média_log, desvio_log, erro_típico_%).
+    Lê um ou mais CSVs enviados pelo usuário e devolve (tabela_limpa, linhas_removidas).
 
-    @st.cache_resource faz o Streamlit treinar uma única vez e reaproveitar
-    o modelo nas próximas interações.
+    Cada arquivo precisa ter as colunas: categoria, hashtags, alcance.
+    Aceita separador vírgula ou ponto e vírgula, e codificação UTF-8 ou Latin-1.
+    """
+    partes = []
+    for arq in arquivos:
+        bruto = arq.getvalue()
+        df = None
+        for codificacao in ("utf-8-sig", "latin-1"):
+            try:
+                # sep=None: o pandas descobre sozinho se o separador é "," ou ";"
+                df = pd.read_csv(
+                    io.BytesIO(bruto), sep=None, engine="python", encoding=codificacao
+                )
+                break
+            except UnicodeDecodeError:
+                continue
+
+        if df is None:
+            raise ValueError(f"Não consegui ler o arquivo '{arq.name}'.")
+
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        faltando = [c for c in COLUNAS if c not in df.columns]
+        if faltando:
+            raise ValueError(
+                f"O arquivo '{arq.name}' não tem a(s) coluna(s): {', '.join(faltando)}."
+            )
+        partes.append(df[COLUNAS])
+
+    df = pd.concat(partes, ignore_index=True)
+    total = len(df)
+
+    # Limpeza: tira linhas vazias, textos em branco e números inválidos
+    df = df.dropna(subset=["categoria"])
+    df["categoria"] = df["categoria"].astype(str).str.strip()
+    df["hashtags"] = pd.to_numeric(df["hashtags"], errors="coerce")
+    df["alcance"] = pd.to_numeric(df["alcance"], errors="coerce")
+    df = df.dropna()
+    df = df[
+        (df["categoria"] != "")
+        & (df["alcance"] > 0)
+        & (df["hashtags"] >= 0)
+        & (df["hashtags"] <= LIMITE_HASHTAGS)
+    ]
+    df["hashtags"] = df["hashtags"].round().astype(int)
+    df["alcance"] = df["alcance"].round().astype(int)
+    df = df.reset_index(drop=True)
+
+    if len(df) < MIN_LINHAS:
+        raise ValueError(
+            f"Foram encontradas só {len(df)} linhas válidas; "
+            f"são necessárias pelo menos {MIN_LINHAS}."
+        )
+    if df["categoria"].nunique() < 2:
+        raise ValueError("Os dados precisam ter pelo menos 2 categorias diferentes.")
+
+    return df, total - len(df)
+
+
+# ---------------------------------------------------------------------------
+# 3) TREINO DO MODELO (TENSORFLOW)
+# ---------------------------------------------------------------------------
+def treinar_modelo(df: pd.DataFrame, origem: str) -> dict:
+    """
+    Treina a rede neural com a tabela recebida e devolve um "pacote" com o
+    modelo e as informações necessárias para usá-lo.
     """
     keras.utils.set_random_seed(SEED)
-    df = gerar_base_simulada()
+
+    # As categorias vêm dos próprios dados (assim categorias novas funcionam)
+    categorias = sorted(df["categoria"].unique().tolist())
 
     # --- Alvo em escala log e padronizado ---------------------------------
-    # Alcances variam de milhares a centenas de milhares. Com o logaritmo e a
+    # Alcances variam de milhares a milhões. Com o logaritmo e a
     # padronização (média 0, desvio 1) o modelo aprende de forma bem mais estável.
     y_log = np.log(df["alcance"].to_numpy(dtype="float64"))
-    media_log, desvio_log = float(y_log.mean()), float(y_log.std())
+    media_log = float(y_log.mean())
+    desvio_log = float(y_log.std()) or 1.0
     y = ((y_log - media_log) / desvio_log).astype("float32")
 
     # --- Divisão 80% treino / 20% teste -----------------------------------
@@ -129,7 +196,7 @@ def treinar_modelo():
     # "StringLookup + CategoryEncoding" em uma única camada.
     entrada_cat = keras.Input(shape=(1,), dtype=tf.string, name="categoria")
     cat_codificada = keras.layers.StringLookup(
-        vocabulary=CATEGORIAS, output_mode="one_hot"
+        vocabulary=categorias, output_mode="one_hot"
     )(entrada_cat)
 
     # Hashtags -> normalizadas (média 0, desvio 1) com a camada Normalization.
@@ -155,19 +222,33 @@ def treinar_modelo():
     # O erro (MAE) está em escala log padronizada; convertemos para "% típico".
     previsto = modelo(x_teste, training=False).numpy().flatten()
     erro_log = float(np.mean(np.abs(previsto - y[teste])) * desvio_log)
-    erro_percentual = float(np.exp(erro_log) - 1)
 
-    return modelo, media_log, desvio_log, erro_percentual
+    return {
+        "modelo": modelo,
+        "media_log": media_log,
+        "desvio_log": desvio_log,
+        "erro_pct": float(np.exp(erro_log) - 1),
+        "categorias": categorias,
+        "max_hashtags": int(df["hashtags"].max()),
+        "n_videos": len(df),
+        "origem": origem,
+    }
 
 
-def prever_alcance(modelo, media_log, desvio_log, categorias, hashtags) -> np.ndarray:
+@st.cache_resource(show_spinner="Preparando o modelo inicial, aguarde alguns segundos...")
+def treinar_base_simulada() -> dict:
+    """Treina uma única vez o modelo inicial (base simulada) e guarda em cache."""
+    return treinar_modelo(gerar_base_simulada(), origem="simulada")
+
+
+def prever_alcance(pacote: dict, categorias, hashtags) -> np.ndarray:
     """Recebe listas de categorias/hashtags e devolve os alcances previstos."""
     entrada = {
         "categoria": tf.constant([[c] for c in categorias]),
         "hashtags": tf.constant([[float(h)] for h in hashtags]),
     }
-    saida = modelo(entrada, training=False).numpy().flatten()
-    return np.exp(saida * desvio_log + media_log)  # volta da escala log
+    saida = pacote["modelo"](entrada, training=False).numpy().flatten()
+    return np.exp(saida * pacote["desvio_log"] + pacote["media_log"])  # volta da escala log
 
 
 # ---------------------------------------------------------------------------
@@ -197,19 +278,57 @@ def main():
         layout="centered",
     )
 
-    modelo, media_log, desvio_log, erro_pct = treinar_modelo()
-
-    # ----- Barra lateral: informações do modelo -----
+    # ----- Barra lateral, parte 1: treinar com arquivos -----
     with st.sidebar:
-        st.header("Sobre o modelo")
-        st.metric("Erro típico no teste", f"± {erro_pct:.0%}")
+        st.header("Treinar a IA")
         st.caption(
-            f"Treinado com {N_VIDEOS} vídeos simulados (80% treino, 20% teste). "
-            "O erro indica a diferença típica entre o alcance previsto e o "
-            "alcance real da base de teste."
+            "Envie arquivos CSV com as colunas **categoria**, **hashtags** e "
+            f"**alcance** (mínimo de {MIN_LINHAS} linhas) e clique em treinar."
         )
+        arquivos = st.file_uploader(
+            "Arquivos de treino (CSV)", type="csv", accept_multiple_files=True
+        )
+        st.download_button(
+            "Baixar exemplo de CSV",
+            data=gerar_base_simulada().head(5).to_csv(index=False),
+            file_name="exemplo_treino.csv",
+            mime="text/csv",
+        )
+
+        if st.button("Treinar modelo", type="primary"):
+            if not arquivos:
+                st.warning("Envie ao menos um arquivo CSV antes de treinar.")
+            else:
+                try:
+                    dados, removidas = ler_arquivos(arquivos)
+                    with st.spinner("Treinando a IA com os seus dados..."):
+                        st.session_state["pacote"] = treinar_modelo(dados, origem="arquivos")
+                    msg = f"Modelo treinado com {len(dados)} vídeos."
+                    if removidas:
+                        msg += f" {removidas} linha(s) inválida(s) foram ignoradas."
+                    st.success(msg)
+                except Exception as erro:  # mostra o motivo em vez de quebrar o app
+                    st.error(f"Não foi possível treinar: {erro}")
+
+        if "pacote" in st.session_state and st.button("Voltar para a base simulada"):
+            del st.session_state["pacote"]
+            st.rerun()
+
+    # Usa o modelo treinado com arquivos; se não houver, o modelo inicial
+    pacote = st.session_state.get("pacote") or treinar_base_simulada()
+    simulado = pacote["origem"] == "simulada"
+
+    # ----- Barra lateral, parte 2: informações do modelo -----
+    with st.sidebar:
         st.divider()
-        st.caption("Critérios do alerta")
+        st.header("Sobre o modelo")
+        st.metric("Erro típico no teste", f"± {pacote['erro_pct']:.0%}")
+        origem_txt = "base simulada" if simulado else "arquivos enviados"
+        st.caption(
+            f"Treinado com {pacote['n_videos']} vídeos ({origem_txt}), "
+            "80% para treino e 20% para teste. O erro indica a diferença "
+            "típica entre o alcance previsto e o real na base de teste."
+        )
         st.caption(
             f"🔴 Flopado: abaixo de {formatar_numero(LIMITE_FLOP)}  \n"
             f"🟡 Regular: de {formatar_numero(LIMITE_FLOP)} a "
@@ -223,21 +342,24 @@ def main():
         "Selecione a categoria do vídeo e a quantidade de hashtags para "
         "estimar o alcance antes de publicar."
     )
-    st.info(
-        "Atenção: esta previsão utiliza dados simulados e serve como "
-        "demonstração. Não representa o desempenho real na plataforma."
-    )
+    if simulado:
+        st.info(
+            "Atenção: esta previsão utiliza dados simulados e serve como "
+            "demonstração. Para usar dados reais, envie arquivos na barra "
+            "lateral e clique em **Treinar modelo**."
+        )
+    else:
+        st.success("Modelo treinado com os arquivos enviados pela equipe.")
 
     col1, col2 = st.columns(2)
-    categoria = col1.selectbox("Categoria do vídeo", CATEGORIAS)
+    categoria = col1.selectbox("Categoria do vídeo", pacote["categorias"])
+    opcoes_hashtags = list(range(pacote["max_hashtags"] + 1))
     hashtags = col2.selectbox(
-        "Quantidade de hashtags", list(range(MAX_HASHTAGS + 1)), index=4
+        "Quantidade de hashtags", opcoes_hashtags, index=min(4, len(opcoes_hashtags) - 1)
     )
 
-    if st.button("Calcular alcance", type="primary"):
-        alcance = float(
-            prever_alcance(modelo, media_log, desvio_log, [categoria], [hashtags])[0]
-        )
+    if st.button("Calcular alcance"):
+        alcance = float(prever_alcance(pacote, [categoria], [hashtags])[0])
         status = classificar(alcance)
 
         st.metric("Alcance previsto (visualizações)", formatar_numero(alcance))
@@ -250,16 +372,18 @@ def main():
             st.error("📉 **FLOPADO**: baixo potencial de alcance neste formato.")
 
         # Gráfico: como o alcance muda conforme o número de hashtags
-        todas = list(range(MAX_HASHTAGS + 1))
-        curva = prever_alcance(
-            modelo, media_log, desvio_log, [categoria] * len(todas), todas
-        )
-        melhor = todas[int(np.argmax(curva))]
+        curva = prever_alcance(pacote, [categoria] * len(opcoes_hashtags), opcoes_hashtags)
+        melhor = opcoes_hashtags[int(np.argmax(curva))]
         st.subheader(f"Alcance previsto por nº de hashtags ({categoria})")
         st.line_chart(
-            pd.DataFrame({"Alcance previsto": curva}, index=pd.Index(todas, name="Hashtags"))
+            pd.DataFrame(
+                {"Alcance previsto": curva},
+                index=pd.Index(opcoes_hashtags, name="Hashtags"),
+            )
         )
-        st.caption(f"Para esta categoria, o modelo indica melhor resultado com cerca de {melhor} hashtags.")
+        st.caption(
+            f"Para esta categoria, o modelo indica melhor resultado com cerca de {melhor} hashtags."
+        )
 
     st.divider()
     st.caption(
